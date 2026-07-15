@@ -152,6 +152,9 @@ from inspect_ai.util._limit import (
     LimitExceededError,
     monitor_working_limit,
     record_sample_limit_data,
+    reset_sample_limit_data,
+    token_limit_usage,
+    turn_count,
 )
 from inspect_ai.util._limit import time_limit as create_time_limit
 from inspect_ai.util._limit import turn_limit as create_turn_limit
@@ -537,6 +540,9 @@ async def task_run(options: TaskRunOptions, task_cancel: TaskCancel | None) -> E
                 # control channel show cancelled samples as pending (re-run
                 # coming) vs cancelled (terminal)
                 will_retry=task_cancel.can_retry if task_cancel is not None else False,
+                # the cancel handle the control channel's task-cancel
+                # directive fires (with "abort" — the display's user-cancel)
+                task_cancel=task_cancel,
             )
 
             # call early stopping if we have it
@@ -812,9 +818,9 @@ async def task_run(options: TaskRunOptions, task_cancel: TaskCancel | None) -> E
 
             # use the SampleErrorHandler's authoritative count (incremented in
             # handle_error() exactly once per sample after retries are
-            # exhausted). With score_on_error, errored samples now return a
-            # populated score dict instead of None, so counting via
-            # `result is None` would miss them.
+            # exhausted). With score_on_error, an errored sample that was still
+            # scored returns a populated score dict rather than None, so counting
+            # errors via `result is None` would miss them.
             sample_error_count = sample_error_handler.error_count
             mark_log_as_error = _should_eval_fail(
                 sample_error_count, profile.samples, config.fail_on_error
@@ -1111,6 +1117,11 @@ async def task_run_sample(
         # materialize sample+state lazily (deferred until semaphore acquired)
         sample, state = await create_sample_state(sample_uuid)
 
+        # reset at the top of the attempt (not just before the limit scopes
+        # open) so that an attempt failing during init doesn't log the prior
+        # attempt's snapshot
+        reset_sample_limit_data()
+
         # validate that we have sample_id (mostly for the typechecker)
         sample_id = sample.id
         if sample_id is None:
@@ -1218,6 +1229,10 @@ async def task_run_sample(
             epoch=state.epoch,
             message_limit=state.message_limit,
             token_limit=state.token_limit,
+            # the metering type is only meaningful when a ceiling is configured
+            token_limit_type=state.token_limit_type
+            if state.token_limit is not None
+            else None,
             cost_limit=state.cost_limit,
             time_limit=time_limit,
             working_limit=working_limit,
@@ -1816,6 +1831,11 @@ async def task_run_sample(
         record_sample_errored(
             task_id, started=_sample_started(), **_sample_usage(state)
         )
+        # no sample_complete here even if the sample was scored: raising fails
+        # the whole eval, whose log finishes with results=None (metrics are
+        # never computed), so there is nothing for the scores to contribute
+        # to — and notifying early stopping/progress for a dying task would
+        # mislead. the scores are still in the sample log written above.
         raise raise_error
 
     # we have an error and should not raise it
@@ -1823,6 +1843,15 @@ async def task_run_sample(
         record_sample_errored(
             task_id, started=_sample_started(), **_sample_usage(state)
         )
+        # the sample may have scores despite the error: score_on_error scoring
+        # of its partial state, scores a solver wrote to state.scores before a
+        # later error, or scores from scorers that completed before another
+        # raised. those scores are already in the sample log, so surface them
+        # here too — the log and metrics should never diverge (mirrors the
+        # `error is None` branch above and matches docs/handling-errors.qmd)
+        if results:
+            await sample_complete(state.sample_id, state.epoch, results)
+            return results
         return None
 
 
@@ -1870,6 +1899,12 @@ def create_eval_sample(
         model_usage=sample_model_usage(),
         role_usage=sample_role_usage(),
         model_fallbacks=sample_model_fallbacks() or None,
+        turn_count=turn_count(),
+        token_limit=state.token_limit,
+        token_limit_type=state.token_limit_type
+        if state.token_limit is not None
+        else None,
+        token_limit_usage=token_limit_usage(),
         started_at=started_at.isoformat() if started_at is not None else None,
         completed_at=datetime.now(timezone.utc).isoformat(),
         total_time=round(total_time, 3) if total_time is not None else None,
@@ -2037,7 +2072,11 @@ def eval_log_sample_source(
                 sample = await read_eval_log_sample_async(
                     eval_log_info, id, epoch, reader=reader
                 )
-            except IndexError:
+            except (IndexError, FileNotFoundError):
+                # IndexError: sample not present in the log. FileNotFoundError:
+                # the log file itself was never written (the prior attempt
+                # failed before its first flush, e.g. an errored log_start()).
+                # Either way there is no prior sample to reuse.
                 return await _resume_if_checkpointed(id, epoch)
             if sample.error is None and sample.invalidation is None:
                 return sample
